@@ -29,7 +29,6 @@ from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 load_dotenv()
 
-
 # Define the model for the request body
 class PromptRequest(BaseModel):
     prompt: str
@@ -43,12 +42,6 @@ class CreateSessionRequest(BaseModel):
 app = FastAPI()
 
 df = pd.read_excel("spend_history_v1.2.xlsx")
-
-# Convert columns to datetime format
-# df['PurchaseDate'] = pd.to_datetime(df['PurchaseDate'], format='%m/%d/%Y')
-# df['contractstartdate'] = pd.to_datetime(df['contractstartdate'], format='%m/%d/%Y')
-# df['contractenddate'] = pd.to_datetime(df['contractenddate'], format='%m/%d/%Y')
-# df['DeliveryDate'] = pd.to_datetime(df['DeliveryDate'], format='%m/%d/%Y')
 
 connection = sqlite3.connect("spend.db")
 df.to_sql(name="PurchaseOrderCatalog", con=connection, if_exists='replace')
@@ -102,7 +95,7 @@ class LLMCallbackHandler(BaseCallbackHandler):
 llm = ChatOpenAI(
     model="gpt-4",
     temperature=0,
-    api_key= os.environ["OPENAI_API_KEY"],
+    api_key=os.environ["OPENAI_API_KEY"],
     callbacks=[LLMCallbackHandler(Path("prompts.jsonl"))]
 )
 
@@ -142,6 +135,148 @@ def check_sql(sql_query: str) -> str:
     """
     return QuerySQLCheckerTool(db=db, llm=llm).invoke({"query": sql_query})
 
+@tool
+def MaverickSpendWithInTailspend(human_message: str) -> list:
+    """
+    Calculate Maverick Spend With in Tailspend;
+    """
+    return """
+WITH SupplierSpend AS (
+    SELECT
+        SupplierID,
+        SUM(Quantity * UnitPrice) AS TotalSpend
+    FROM PurchaseOrderCatalog
+    GROUP BY SupplierID
+),
+RankedSupplierSpend AS (
+    SELECT
+        SupplierID,
+        TotalSpend,
+        SUM(TotalSpend) OVER (ORDER BY TotalSpend DESC) AS CumulativeSpend,
+        SUM(TotalSpend) OVER () AS TotalOverallSpend
+    FROM SupplierSpend
+),
+TailSpendSuppliers AS (
+    SELECT
+        SupplierID,
+        TotalSpend
+    FROM RankedSupplierSpend
+    WHERE CumulativeSpend > (TotalOverallSpend * 0.80) -- Last 20% of total spend
+       OR TotalSpend < 100000 -- Suppliers with less than $100,000 spend
+),
+TailSpendPurchases AS (
+    SELECT *
+    FROM PurchaseOrderCatalog
+    WHERE SupplierID IN (SELECT SupplierID FROM TailSpendSuppliers)
+),
+MaverickTailSpendPurchases AS (
+    SELECT *
+    FROM TailSpendPurchases
+    WHERE ContractID IS NULL -- Suppliers without a contract
+)
+SELECT
+    SUM(Quantity * UnitPrice) AS TotalMaverickTailSpend
+FROM MaverickTailSpendPurchases;
+"""
+
+@tool
+def Maverick_Spend_Calculator(human_message: str) -> list:
+    """
+    Calculate MaverickSpend, MaverickPercentage;
+    """
+    return """
+    -- Calculate total spend
+WITH TotalSpend AS (
+    SELECT SUM(TotalCost) AS TotalSpend
+    FROM PurchaseOrderCatalog
+),
+
+-- Calculate maverick spend (purchases without a contract)
+MaverickSpend AS (
+    SELECT SUM(TotalCost) AS MaverickSpend
+    FROM PurchaseOrderCatalog
+    WHERE ContractID IS NULL
+),
+
+-- Calculate percentage of maverick spend
+MaverickPercentage AS (
+    SELECT (CAST(MaverickSpend.MaverickSpend AS FLOAT) / TotalSpend.TotalSpend) * 100 AS MaverickPercentage
+    FROM MaverickSpend, TotalSpend
+),
+
+-- Maverick spend by category
+MaverickByCategory AS (
+    SELECT Category, SUM(TotalCost) AS CategoryMaverickSpend
+    FROM PurchaseOrderCatalog
+    WHERE ContractID IS NULL
+    GROUP BY Category
+    ORDER BY CategoryMaverickSpend DESC
+)
+
+-- Print results
+SELECT
+    '$' || printf('%.2f', MaverickSpend.MaverickSpend) AS MaverickSpend,
+    printf('%.2f%%', MaverickPercentage.MaverickPercentage) AS MaverickPercentage,
+    GROUP_CONCAT(MaverickByCategory.Category || ': $' || printf('%.2f', MaverickByCategory.CategoryMaverickSpend), char(10)) AS MaverickSpendByCategory
+FROM TotalSpend, MaverickSpend, MaverickPercentage, MaverickByCategory;
+"""
+
+@tool
+def Tail_Spend_Calculator(human_message: str) -> list:
+    """
+    Calculate Tail spend by executing below query;
+    """
+    return """
+WITH
+SupplierSpend AS (
+    SELECT
+        "Supplier Name",
+        SUM(TotalCost) AS SupplierSpend
+    FROM
+        catalogPO
+    GROUP BY
+        "Supplier Name"
+),
+TotalSpend AS (
+    SELECT
+        SUM(SupplierSpend) AS TotalSpend
+    FROM
+        SupplierSpend
+),
+CumulativeSpend AS (
+    SELECT
+        "Supplier Name",
+        SupplierSpend,
+        SUM(SupplierSpend) OVER (ORDER BY SupplierSpend DESC) AS CumulativeSpend,
+        (SUM(SupplierSpend) OVER (ORDER BY SupplierSpend DESC)) / (SELECT TotalSpend FROM TotalSpend) * 100 AS CumulativePercentage
+    FROM
+        SupplierSpend
+),
+TailSpendThreshold AS (
+    SELECT
+        SupplierSpend
+    FROM
+        CumulativeSpend
+    WHERE
+        CumulativePercentage >= 80
+    ORDER BY
+        SupplierSpend ASC
+    LIMIT 1
+),
+TailSpend AS (
+    SELECT
+        SUM(SupplierSpend) AS TotalTailSpend
+    FROM
+        SupplierSpend
+    WHERE
+        SupplierSpend < (SELECT SupplierSpend FROM TailSpendThreshold) OR SupplierSpend < 100000
+)
+SELECT
+    TotalTailSpend
+FROM
+    TailSpend;
+"""
+
 sql_dev = Agent(
     role="Senior SQLite Database Developer",
     goal="Construct and execute SQLite queries based on a request",
@@ -149,7 +284,7 @@ sql_dev = Agent(
         """
         You are an experienced database developer who is master at creating efficient and complex SQLite queries.
         You have a deep understanding of how different databases work and how to optimize queries.
-        You also have strong expertise in answering finanacial questions.
+        You can modify the tools query according to the database columns name and content with your intelligence
         Your skill is very good at creating SQLite queries which can fetch out the business questions.
         Be careful while working with TIMESTAMP type of column.
         **Before Using any tool first analyse Recent Chat History to answer the query. Do not call any tool if answer is already present in chat history**
@@ -163,7 +298,7 @@ sql_dev = Agent(
     """
     ),
     llm=llm,
-    tools=[list_tables, tables_schema, execute_sql, check_sql],
+    tools=[list_tables, tables_schema, execute_sql, check_sql, Tail_Spend_Calculator, Maverick_Spend_Calculator, MaverickSpendWithInTailspend],
     allow_delegation=False,
 )
 
@@ -179,7 +314,6 @@ bus_analyst = Agent(
                 Knowledge of various spend dimensions (e.g., supplier, department, product, geography), and
                 Familiarity with financial metrics and KPIs.
             """
-
     ),
     llm=llm,
     allow_delegation=False,
@@ -203,11 +337,8 @@ report_writer = Agent(
 
 extract_data = Task(
     description="""Extract data from the database that is required for the answering {query}.
-    Create the queries in such a way that Business analyst can fetch out the information for the query.
-    Never query for all the columns from a specific table, only ask for
-    the relevant columns given the question.
-    Always include the result of the SQL query in your task output""",
-    expected_output="Database result for the query",
+    Create the queries in such a way that Data Scientist can fetch out the information for the query.""",
+    expected_output="Database result for the query with the Explanation of the Query and Outcome.",
     agent=sql_dev,
 )
 
@@ -219,8 +350,7 @@ analyze_data = Task(
                 the data in a convenient manner.''',
     agent=bus_analyst,
     context=[extract_data]
-        )
-
+)
 
 write_report = Task(
     description=dedent(
@@ -312,7 +442,7 @@ async def get_history(session_id: str):
 @app.post("/create_session")
 async def create_session(request: CreateSessionRequest):
     session_id = str(uuid.uuid4())
-    session_name = f"Mohan {len(session_history) + 1}"
+    session_name = f"session{len(session_history) + 1}"
     session_history[session_id] = {"session_name": session_name, "history": []}
     return {"session_id": session_id, "session_name": session_name}
 
